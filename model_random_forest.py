@@ -1,7 +1,7 @@
 import pandas as pd
 import numpy as np
-import xgboost as xgb
-from sklearn.model_selection import KFold, train_test_split # Need train_test_split again for early stopping eval set
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import KFold # <-- New import
 from sklearn.metrics import mean_squared_error
 import optuna
 from optuna.samplers import TPESampler
@@ -14,8 +14,13 @@ warnings.filterwarnings('ignore', category=UserWarning)
 warnings.filterwarnings('ignore', category=FutureWarning)
 warnings.filterwarnings('ignore', category=Warning)
 
+
 # --- PREPROCESSING FUNCTION ---
-def preprocess_data(df, is_train=True, train_stats=None):    
+def preprocess_data(df, is_train=True, train_stats=None):
+    """
+    Your winning v3 preprocessing function.
+    """
+    
     # === 1. Handle Missingness ===
     df['Supplier_Reliability_is_Missing'] = df['Supplier_Reliability'].isna().astype(int)
     
@@ -88,7 +93,7 @@ def preprocess_data(df, is_train=True, train_stats=None):
         
     df = pd.get_dummies(df, columns=['Equipment_Type', 'Transport_Method'], drop_first=True)
     
-    # === 5. Interaction Feature Engineering ===
+    # === 5. NEW Interaction Feature Engineering ===
     df['Urgent_x_CrossBorder'] = df['Urgent_Shipping'] * df['CrossBorder_Shipping']
     df['Fragile_x_Rural'] = df['Fragile_Equipment'] * df['Rural_Hospital']
     df['Fragile_x_Urgent'] = df['Fragile_Equipment'] * df['Urgent_Shipping']
@@ -116,51 +121,34 @@ X_full = df_train_clean.drop(columns=['Transport_Cost'])
 # --- 3. K-FOLD VALIDATION ---
 print("Using K-Fold Cross-Validation for hyperparameter tuning...")
 
-# --- 4. OPTUNA HYPERPARAMETER TUNING (WITH K-FOLD FOR XGBOOST + EARLY STOPPING) ---
+# --- 4. OPTUNA HYPERPARAMETER TUNING (WITH K-FOLD) ---
 def objective(trial):
-    """Define the objective function for Optuna to optimize for XGBoost."""
+    """Define the objective function for Optuna to optimize."""
     params = {
-        'objective': 'reg:squarederror', 
-        'eval_metric': 'rmse',
-        # --- NEW FOCUSED SEARCH SPACE for XGBoost ---
-        # Based on best params: {'n_estimators': 1324, 'learning_rate': 0.104..., 'max_depth': 3, ...}
-        'n_estimators': trial.suggest_int('n_estimators', 1000, 2500), # Wider range around 1324, ES handles it
-        'learning_rate': trial.suggest_float('learning_rate', 0.05, 0.15, log=True), # Centered around 0.104
-        'max_depth': trial.suggest_int('max_depth', 2, 5),               # Centered around 3
-        'subsample': trial.suggest_float('subsample', 0.75, 0.95),         # Centered around 0.868
-        'colsample_bytree': trial.suggest_float('colsample_bytree', 0.65, 0.85), # Centered around 0.774
-        'gamma': trial.suggest_float('gamma', 0.01, 0.1, log=True),        # Centered around 0.050
-        'reg_alpha': trial.suggest_float('reg_alpha', 1e-6, 1e-3, log=True), # Range covering very small value
-        'reg_lambda': trial.suggest_float('reg_lambda', 0.01, 0.1, log=True),   # Centered around 0.031
+        # --- ADJUSTED FOCUSED SEARCH SPACE ---
+        # Based on your best params: {'n_estimators': 623, 'max_depth': 25, 'min_samples_split': 4, 'min_samples_leaf': 2, 'max_features': 0.98...}
+        'n_estimators': trial.suggest_int('n_estimators', 400, 800),       # <-- ADJUSTED: Centered around 623
+        'max_depth': trial.suggest_int('max_depth', 15, 30),              # Centered around 25 (Good)
+        'min_samples_split': trial.suggest_int('min_samples_split', 2, 8), # <-- ADJUSTED: Centered around 4
+        'min_samples_leaf': trial.suggest_int('min_samples_leaf', 1, 5),    # <-- ADJUSTED: Centered around 2
+        'max_features': trial.suggest_float('max_features', 0.8, 1.0),      # Focus on high values (Good)
         'random_state': 42,
-        'n_jobs': -1,
-        'tree_method': 'hist',
-        'early_stopping_rounds': 50 
+        'n_jobs': -1
     }
     
-    model = xgb.XGBRegressor(**params) 
+    model = RandomForestRegressor(**params)
     
     kf = KFold(n_splits=5, shuffle=True, random_state=42)
     rmses = []
 
-    for fold, (train_index, val_index) in enumerate(kf.split(X_full)):
+    for train_index, val_index in kf.split(X_full):
         X_train_k, X_val_k = X_full.iloc[train_index], X_full.iloc[val_index]
         y_train_k = y_full_log.iloc[train_index]
         y_val_k_dollar = y_full.iloc[val_index]
         
-        # --- Create Evaluation Set for Early Stopping (within the fold) ---
-        X_train_fold, X_eval_fold, y_train_fold, y_eval_fold = train_test_split(
-            X_train_k, y_train_k, test_size=0.15, random_state=42 + fold 
-        )
+        model.fit(X_train_k, y_train_k)
         
-        # --- Fit with Early Stopping ---
-        model.fit(X_train_fold, y_train_fold, 
-                  eval_set=[(X_eval_fold, y_eval_fold)], 
-                  verbose=False) 
-        
-        # Predict on the main K-Fold validation set
-        best_iteration = model.best_iteration if hasattr(model, 'best_iteration') else None
-        preds_log = model.predict(X_val_k, iteration_range=(0, best_iteration) if best_iteration is not None else None)
+        preds_log = model.predict(X_val_k)
         preds_dollar = np.expm1(preds_log)
         
         rmse = np.sqrt(mean_squared_error(y_val_k_dollar, preds_dollar))
@@ -168,18 +156,16 @@ def objective(trial):
     
     return np.mean(rmses)
 
-print("\nStarting FINE-TUNED hyperparameter search for XGBoost (300 trials, 5-Fold CV)...")
+print("\nStarting FINE-TUNED hyperparameter search (300 trials, 5-Fold CV)...")
 print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
-print("!!! WARNING: This will take some time to run!!!")
+print("!!! WARNING: This will take some time to run. !!!")
 print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
 
 sampler = TPESampler(seed=42)
 study = optuna.create_study(direction='minimize', sampler=sampler)
-study.optimize(objective, n_trials=300) 
+study.optimize(objective, n_trials=300)
 
 best_params = study.best_params
-best_params.pop('early_stopping_rounds', None) 
-
 print("\n--- OPTUNA FINE-TUNING COMPLETE ---")
 print(f"Best 5-Fold CV RMSE found: ${study.best_value:,.2f}")
 print("Best parameters found:")
@@ -200,11 +186,10 @@ df_test_clean = preprocess_data(df_test_orig, is_train=False, train_stats=train_
 X_test_final = df_test_clean.reindex(columns=X_full.columns, fill_value=0)
 
 # --- 7. RE-TRAIN MODEL ON 100% OF DATA WITH BEST PARAMS ---
-print("Re-training XGBoost model on 100% of data using best parameters...")
+print("Re-training Random Forest model on 100% of data using best parameters...")
 y_full_log = np.log1p(y_full)
-
-final_model = xgb.XGBRegressor(**best_params, random_state=42, n_jobs=-1) 
-final_model.fit(X_full, y_full_log, verbose=False) # Train on ALL data
+final_model = RandomForestRegressor(**best_params, random_state=42, n_jobs=-1)
+final_model.fit(X_full, y_full_log) 
 
 # --- 8. MAKE FINAL PREDICTIONS ---
 print("Making final predictions on test.csv...")
@@ -214,8 +199,9 @@ preds_dollar = np.maximum(preds_dollar, 0)
 
 # --- 9. CREATE SUBMISSION FILE ---
 submission = pd.DataFrame({'Hospital_Id': submission_ids, 'Transport_Cost': preds_dollar})
-submission.to_csv("submission_xgb_v3_fine_tuned.csv", index=False)
+submission.to_csv("submission_rf_v3_fine_tuned.csv", index=False)
 
-print(f"\n✓ submission_xgb_v3_fine_tuned.csv created successfully!")
+print(f"\n✓ submission_rf_v3_fine_tuned.csv created successfully!")
 print("First few predictions:")
 print(submission.head())
+
